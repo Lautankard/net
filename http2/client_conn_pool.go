@@ -31,6 +31,7 @@ var (
 )
 
 // TODO: use singleflight for dialing and addConnCalls?
+//默认的连接池管理
 type clientConnPool struct {
 	t *Transport
 
@@ -86,7 +87,7 @@ func (p *clientConnPool) getClientConn(req *http.Request, addr string, dialOnMis
 	}
 	p.mu.Lock()
 	for _, cc := range p.conns[addr] {
-		if st := cc.idleState(); st.canTakeNewRequest {
+		if st := cc.idleState(); st.canTakeNewRequest { //只要一个连接是可用的，多个连接获取请求获取的是同一个连接
 			if p.shouldTraceGetConn(st) {
 				traceGetConn(req, addr)
 			}
@@ -116,7 +117,7 @@ type dialCall struct {
 
 // requires p.mu is held.
 func (p *clientConnPool) getStartDialLocked(addr string) *dialCall {
-	if call, ok := p.dialing[addr]; ok {
+	if call, ok := p.dialing[addr]; ok { //并发情况下多个获取连接操作可能获取同一个连接
 		// A dial is already in-flight. Don't start another.
 		return call
 	}
@@ -133,11 +134,11 @@ func (p *clientConnPool) getStartDialLocked(addr string) *dialCall {
 func (c *dialCall) dial(addr string) {
 	const singleUse = false // shared conn
 	c.res, c.err = c.p.t.dialClientConn(addr, singleUse)
-	close(c.done)
+	close(c.done) //立马关闭chan告诉等待端连接结果，而不必等待下面的操作
 
 	c.p.mu.Lock()
 	delete(c.p.dialing, addr)
-	if c.err == nil {
+	if c.err == nil { //添加到连接池中
 		c.p.addConnLocked(addr, c.res)
 	}
 	c.p.mu.Unlock()

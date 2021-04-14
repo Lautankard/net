@@ -73,6 +73,7 @@ type Transport struct {
 
 	// ConnPool optionally specifies an alternate connection pool to use.
 	// If nil, the default is used.
+	//用于管理连接的连接池管理者
 	ConnPool ClientConnPool
 
 	// DisableCompression, if true, prevents the Transport from
@@ -691,7 +692,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 	if max := t.maxHeaderListSize(); max != 0 {
 		initialSettings = append(initialSettings, Setting{ID: SettingMaxHeaderListSize, Val: max})
 	}
-
+	//发送前言，用于互通问候
 	cc.bw.Write(clientPreface)
 	cc.fr.WriteSettings(initialSettings...)
 	cc.fr.WriteWindowUpdate(0, transportDefaultConnFlow)
@@ -766,8 +767,9 @@ func (cc *ClientConn) idleState() clientConnIdleState {
 	return cc.idleStateLocked()
 }
 
+//获取ClientConn空闲状态
 func (cc *ClientConn) idleStateLocked() (st clientConnIdleState) {
-	if cc.singleUse && cc.nextStreamID > 1 {
+	if cc.singleUse && cc.nextStreamID > 1 { //ClientConn是单独使用的并且已经被使用
 		return
 	}
 	var maxConcurrentOkay bool
@@ -780,10 +782,11 @@ func (cc *ClientConn) idleStateLocked() (st clientConnIdleState) {
 	} else {
 		maxConcurrentOkay = int64(len(cc.streams)+1) < int64(cc.maxConcurrentStreams)
 	}
-
+	//是否收到了goAway帧，是否已经关闭或正在关闭、是否还可以复用去发送、是否有可用流ID、是否空闲了太长时间
 	st.canTakeNewRequest = cc.goAway == nil && !cc.closed && !cc.closing && maxConcurrentOkay &&
 		int64(cc.nextStreamID)+2*int64(cc.pendingRequests) < math.MaxInt32 &&
 		!cc.tooIdleLocked()
+	//标识是否是一个新连接
 	st.freshConn = cc.nextStreamID == 1 && st.canTakeNewRequest
 	return
 }
@@ -795,6 +798,7 @@ func (cc *ClientConn) canTakeNewRequestLocked() bool {
 
 // tooIdleLocked reports whether this connection has been been sitting idle
 // for too much wall time.
+//ClientConn是否空闲过长时间
 func (cc *ClientConn) tooIdleLocked() bool {
 	// The Round(0) strips the monontonic clock reading so the
 	// times are compared based on their wall time. We don't want
@@ -1030,20 +1034,22 @@ func (cc *ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAfterReqBodyWrite bool, err error) {
+	//检测header
 	if err := checkConnHeaders(req); err != nil {
 		return nil, false, err
 	}
 	if cc.idleTimer != nil {
 		cc.idleTimer.Stop()
 	}
-
+	//获取tailer
 	trailers, err := commaSeparatedTrailers(req)
 	if err != nil {
 		return nil, false, err
 	}
 	hasTrailers := trailers != ""
-
+	//因为conn是共享的所以操作要加锁
 	cc.mu.Lock()
+	//等待一个创建流的允许
 	if err := cc.awaitOpenSlotForRequest(req); err != nil {
 		cc.mu.Unlock()
 		return nil, false, err
@@ -1077,12 +1083,13 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 	// we send: HEADERS{1}, CONTINUATION{0,} + DATA{0,} (DATA is
 	// sent by writeRequestBody below, along with any Trailers,
 	// again in form HEADERS{1}, CONTINUATION{0,})
+	//序列化Header
 	hdrs, err := cc.encodeHeaders(req, requestedGzip, trailers, contentLen)
 	if err != nil {
 		cc.mu.Unlock()
 		return nil, false, err
 	}
-
+	//创建流
 	cs := cc.newStream()
 	cs.req = req
 	cs.trace = httptrace.ContextClientTrace(req.Context())
@@ -1101,6 +1108,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 
 	cc.wmu.Lock()
 	endStream := !hasBody && !hasTrailers
+	//写Header信息
 	werr := cc.writeHeaders(cs.ID, endStream, int(cc.maxFrameSize), hdrs)
 	cc.wmu.Unlock()
 	traceWroteHeaders(cs.trace)
@@ -1163,7 +1171,7 @@ func (cc *ClientConn) roundTrip(req *http.Request) (res *http.Response, gotErrAf
 
 	for {
 		select {
-		case re := <-readLoopResCh:
+		case re := <-readLoopResCh: //ClientConn在被创建的时候会开启一个routine来读取数据，并解析，然后根据streamID，将解析的response发送到cs.readLoopResCh
 			return handleReadLoopResponse(re)
 		case <-respHeaderTimer:
 			if !hasBody || bodyWritten {
@@ -1244,6 +1252,7 @@ func (cc *ClientConn) awaitOpenSlotForRequest(req *http.Request) error {
 		// Unfortunately, we cannot wait on a condition variable and channel at
 		// the same time, so instead, we spin up a goroutine to check if the
 		// request is canceled while we wait for a slot to open in the connection.
+		//一方面awaitOpenSlotForRequest在等待连接有可用的流，另一方面需要检测请求取消的消息,因为cond和chan不能同时等待，所以开启了新的协程
 		if waitingForConn == nil {
 			waitingForConn = make(chan struct{})
 			go func() {
@@ -1305,6 +1314,7 @@ var (
 	errReqBodyTooLong = errors.New("http2: request body larger than specified content length")
 )
 
+//写body操作，从body读取数据，写入帧
 func (cs *clientStream) writeRequestBody(body io.Reader, bodyCloser io.Closer) (err error) {
 	cc := cs.cc
 	sentEnd := false // whether we sent the final DATA frame w/ END_STREAM
@@ -2591,8 +2601,8 @@ type bodyWriterState struct {
 	cs     *clientStream
 	timer  *time.Timer   // if non-nil, we're doing a delayed write
 	fnonce *sync.Once    // to call fn with
-	fn     func()        // the code to run in the goroutine, writing the body
-	resc   chan error    // result of fn's execution
+	fn     func()        // the code to run in the goroutine, writing the body 写body操作
+	resc   chan error    // result of fn's execution 写body操作结果
 	delay  time.Duration // how long we should delay a delayed write for
 }
 
